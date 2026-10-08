@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>G3D 6.10 Gouraud Renderer + Physics</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            user-select: none;
+        }
+        body, html {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: #000;
+            font-family: "Courier New", Courier, monospace;
+        }
+        canvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 12px;
+            left: 12px;
+            background: rgba(20, 24, 30, 0.85);
+            border: 1px solid #556677;
+            color: #d0d8e0;
+            padding: 12px 16px;
+            border-radius: 4px;
+            font-size: 13px;
+            line-height: 1.5;
+            box-shadow: 2px 2px 8px rgba(0,0,0,0.5);
+            max-width: 340px;
+        }
+        #hud h1 {
+            font-size: 14px;
+            color: #ffcc00;
+            margin-bottom: 6px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        .control-row {
+            margin-top: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .control-row label {
+            font-size: 12px;
+        }
+        .control-row input[type=range] {
+            width: 130px;
+        }
+        #info {
+            margin-top: 10px;
+            font-size: 11px;
+            color: #8899aa;
+            border-top: 1px solid #334455;
+            padding-top: 6px;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="hud">
+        <h1>G3D 6.10 + Physics</h1>
+        <div>Gouraud Shading & Sphere Physics</div>
+        <div class="control-row">
+            <label>Shininess:</label>
+            <input id="shininess" type="range" min="4" max="64" value="24">
+        </div>
+        <div class="control-row">
+            <label>Sun Pitch:</label>
+            <input id="sunAngle" type="range" min="15" max="85" value="50">
+        </div>
+        <div class="control-row">
+            <label>Fog Density:</label>
+            <input id="fogEnd" type="range" min="20" max="90" value="45">
+        </div>
+        <div id="info">
+            • <b>Left Click / Drag:</b> Orbit Camera<br>
+            • <b>Right Click / Spacebar:</b> Drop Physics Sphere<br>
+            • <b>Scroll:</b> Zoom
+        </div>
+    </div>
+
+    <canvas id="glcanvas"></canvas>
+
+<script>
+// ============================================================================
+// 1. G3D-STYLE VECTOR & CFRAME MATH (No External Libraries)
+// ============================================================================
+const Vec3 = {
+    create: (x = 0, y = 0, z = 0) => new Float32Array([x, y, z]),
+    normalize: (v) => {
+        const l = Math.hypot(v[0], v[1], v[2]) || 1;
+        return new Float32Array([v[0] / l, v[1] / l, v[2] / l]);
+    },
+    cross: (a, b) => new Float32Array([
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0]
+    ]),
+    dot: (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2],
+    sub: (a, b) => new Float32Array([a[0] - b[0], a[1] - b[1], a[2] - b[2]]),
+    add: (a, b) => new Float32Array([a[0] + b[0], a[1] + b[1], a[2] + b[2]]),
+    scale: (v, s) => new Float32Array([v[0] * s, v[1] * s, v[2] * s]),
+    len: (v) => Math.hypot(v[0], v[1], v[2])
+};
+
+const Mat4 = {
+    createIdentity: () => new Float32Array([
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1
+    ]),
+    perspective: (fovy, aspect, near, far) => {
+        const f = 1.0 / Math.tan(fovy / 2);
+        const nf = 1 / (near - far);
+        return new Float32Array([
+            f / aspect, 0, 0, 0,
+            0, f, 0, 0,
+            0, 0, (far + near) * nf, -1,
+            0, 0, (2 * far * near) * nf, 0
+        ]);
+    },
+    lookAt: (eye, target, up) => {
+        const z = Vec3.normalize(Vec3.sub(eye, target));
+        const x = Vec3.normalize(Vec3.cross(up, z));
+        const y = Vec3.cross(z, x);
+        return new Float32Array([
+            x[0], y[0], z[0], 0,
+            x[1], y[1], z[1], 0,
+            x[2], y[2], z[2], 0,
+            -Vec3.dot(x, eye), -Vec3.dot(y, eye), -Vec3.dot(z, eye), 1
+        ]);
+    }
+};
+
+class CFrame {
+    constructor(x = 0, y = 0, z = 0, yaw = 0, pitch = 0, roll = 0) {
+        this.position = Vec3.create(x, y, z);
+        this.yaw = yaw;
+        this.pitch = pitch;
+        this.roll = roll;
+    }
+    toMat4() {
+        const cy = Math.cos(this.yaw), sy = Math.sin(this.yaw);
+        const cp = Math.cos(this.pitch), sp = Math.sin(this.pitch);
+        const cr = Math.cos(this.roll), sr = Math.sin(this.roll);
+
+        return new Float32Array([
+            cy * cr + sy * sp * sr, cp * sr, -sy * cr + cy * sp * sr, 0,
+            -cy * sr + sy * sp * cr, cp * cr,  sy * sr + cy * sp * cr, 0,
+            sy * cp,                -sp,      cy * cp,                 0,
+            this.position[0], this.position[1], this.position[2],      1
+        ]);
+    }
+}
+
+// ============================================================================
+// 2. SHADERS (Strict Per-Vertex Gouraud Lighting + Gamma 1.0)
+// ============================================================================
+const vsSource = `
+    attribute vec3 aPosition;
+    attribute vec3 aNormal;
+    attribute vec3 aColor;
+
+    uniform mat4 uModel;
+    uniform mat4 uView;
+    uniform mat4 uProjection;
+    uniform mat3 uNormalMatrix;
+
+    uniform vec3 uLightDir;
+    uniform vec3 uLightColor;
+    uniform vec3 uAmbientColor;
+    uniform vec3 uViewPos;
+    uniform float uShininess;
+
+    uniform float uFogStart;
+    uniform float uFogEnd;
+
+    varying vec3 vLitColor;
+    varying float vFogFactor;
+
+    void main() {
+        vec4 worldPos = uModel * vec4(aPosition, 1.0);
+        vec4 viewPos  = uView * worldPos;
+        gl_Position   = uProjection * viewPos;
+
+        vec3 N = normalize(uNormalMatrix * aNormal);
+        vec3 L = normalize(uLightDir);
+        vec3 V = normalize(uViewPos - worldPos.xyz);
+        vec3 H = normalize(L + V);
+
+        float NdotL = max(dot(N, L), 0.0);
+        vec3 diffuse = NdotL * uLightColor;
+
+        float specular = 0.0;
+        if (NdotL > 0.0) {
+            float NdotH = max(dot(N, H), 0.0);
+            specular = pow(NdotH, uShininess);
+        }
+        vec3 specColor = specular * uLightColor;
+
+        vLitColor = aColor * (uAmbientColor + diffuse) + specColor * 0.7;
+
+        float dist = length(viewPos.xyz);
+        vFogFactor = clamp((uFogEnd - dist) / (uFogEnd - uFogStart), 0.0, 1.0);
+    }
+`;
+
+const fsSource = `
+    precision mediump float;
+    varying vec3 vLitColor;
+    varying float vFogFactor;
+    uniform vec3 uFogColor;
+
+    void main() {
+        vec3 finalColor = mix(uFogColor, vLitColor, vFogFactor);
+        gl_FragColor = vec4(finalColor, 1.0);
+    }
+`;
+
+// ============================================================================
+// 3. GEOMETRY GENERATORS
+// ============================================================================
+function createCube(sx, sy, sz, color) {
+    const p = [
+        -sx,-sy, sz,  sx,-sy, sz,  sx, sy, sz, -sx,-sy, sz,  sx, sy, sz, -sx, sy, sz,
+        -sx,-sy,-sz, -sx, sy,-sz,  sx, sy,-sz, -sx,-sy,-sz,  sx, sy,-sz,  sx,-sy,-sz,
+        -sx, sy,-sz, -sx, sy, sz,  sx, sy, sz, -sx, sy,-sz,  sx, sy, sz,  sx, sy,-sz,
+        -sx,-sy,-sz,  sx,-sy,-sz,  sx,-sy, sz, -sx,-sy,-sz,  sx,-sy, sz, -sx,-sy, sz,
+         sx,-sy,-sz,  sx, sy,-sz,  sx, sy, sz,  sx,-sy,-sz,  sx, sy, sz,  sx,-sy, sz,
+        -sx,-sy,-sz, -sx,-sy, sz, -sx, sy, sz, -sx,-sy,-sz, -sx, sy, sz, -sx, sy,-sz
+    ];
+    const n = [
+        0, 0, 1,  0, 0, 1,  0, 0, 1,  0, 0, 1,  0, 0, 1,  0, 0, 1,
+        0, 0,-1,  0, 0,-1,  0, 0,-1,  0, 0,-1,  0, 0,-1,  0, 0,-1,
+        0, 1, 0,  0, 1, 0,  0, 1, 0,  0, 1, 0,  0, 1, 0,  0, 1, 0,
+        0,-1, 0,  0,-1, 0,  0,-1, 0,  0,-1, 0,  0,-1, 0,  0,-1, 0,
+        1, 0, 0,  1, 0, 0,  1, 0, 0,  1, 0, 0,  1, 0, 0,  1, 0, 0,
+       -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0
+    ];
+    const c = [];
+    for (let i = 0; i < p.length / 3; i++) c.push(...color);
+    return { positions: new Float32Array(p), normals: new Float32Array(n), colors: new Float32Array(c), count: p.length / 3 };
+}
+
+function createSphere(radius, rings, sectors, color) {
+    const p = [], n = [], c = [];
+    for (let r = 0; r < rings; ++r) {
+        for (let s = 0; s < sectors; ++s) {
+            const pushVertex = (rIdx, sIdx) => {
+                const theta = (rIdx * Math.PI) / rings;
+                const phi   = (sIdx * 2 * Math.PI) / sectors;
+                const nx = Math.sin(theta) * Math.cos(phi);
+                const ny = Math.cos(theta);
+                const nz = Math.sin(theta) * Math.sin(phi);
+                p.push(nx * radius, ny * radius, nz * radius);
+                n.push(nx, ny, nz);
+                c.push(...color);
+            };
+            pushVertex(r, s);
+            pushVertex(r + 1, s);
+            pushVertex(r + 1, s + 1);
+
+            pushVertex(r, s);
+            pushVertex(r + 1, s + 1);
+            pushVertex(r, s + 1);
+        }
+    }
+    return { positions: new Float32Array(p), normals: new Float32Array(n), colors: new Float32Array(c), count: p.length / 3 };
+}
+
+function createGridFloor(size, tiles, c1, c2) {
+    const p = [], n = [], c = [];
+    const step = size / tiles;
+    const half = size / 2;
+    for (let i = 0; i < tiles; i++) {
+        for (let j = 0; j < tiles; j++) {
+            const x0 = -half + i * step;
+            const x1 = x0 + step;
+            const z0 = -half + j * step;
+            const z1 = z0 + step;
+            const col = ((i + j) % 2 === 0) ? c1 : c2;
+
+            p.push(x0, 0, z0,  x0, 0, z1,  x1, 0, z1,  x0, 0, z0,  x1, 0, z1,  x1, 0, z0);
+            for (let k = 0; k < 6; k++) {
+                n.push(0, 1, 0);
+                c.push(...col);
+            }
+        }
+    }
+    return { positions: new Float32Array(p), normals: new Float32Array(n), colors: new Float32Array(c), count: p.length / 3 };
+}
+
+// ============================================================================
+// 4. EMBEDDED 3D PHYSICS ENGINE (Zero Dependencies)
+// ============================================================================
+class PhysicsWorld {
+    constructor() {
+        this.gravity = Vec3.create(0, -18.0, 0);
+        this.restitution = 0.65; // Bounciness
+        this.friction = 0.98;    // Air/surface drag
+        this.spheres = [];
+        this.staticBoxes = [];
+    }
+
+    addSphere(sphereBody) {
+        this.spheres.push(sphereBody);
+    }
+
+    addStaticBox(boxBody) {
+        this.staticBoxes.push(boxBody);
+    }
+
+    step(dt) {
+        // 1. Numerical Integration (Euler Stepper)
+        for (const s of this.spheres) {
+            s.vel[0] += this.gravity[0] * dt;
+            s.vel[1] += this.gravity[1] * dt;
+            s.vel[2] += this.gravity[2] * dt;
+
+            s.cframe.position[0] += s.vel[0] * dt;
+            s.cframe.position[1] += s.vel[1] * dt;
+            s.cframe.position[2] += s.vel[2] * dt;
+
+            // Floor collision at y = 0
+            if (s.cframe.position[1] - s.radius < 0) {
+                s.cframe.position[1] = s.radius;
+                s.vel[1] = -s.vel[1] * this.restitution;
+                s.vel[0] *= this.friction;
+                s.vel[2] *= this.friction;
+            }
+
+            // 2. Sphere-to-Box Collisions
+            for (const box of this.staticBoxes) {
+                // Find closest point on Box to Sphere center
+                const p = s.cframe.position;
+                const min = box.min, max = box.max;
+                const cx = Math.max(min[0], Math.min(p[0], max[0]));
+                const cy = Math.max(min[1], Math.min(p[1], max[1]));
+                const cz = Math.max(min[2], Math.min(p[2], max[2]));
+
+                const diff = Vec3.create(p[0] - cx, p[1] - cy, p[2] - cz);
+                const dist = Vec3.len(diff);
+
+                if (dist < s.radius && dist > 0.0001) {
+                    const normal = Vec3.normalize(diff);
+                    // Penetration resolution
+                    const overlap = s.radius - dist;
+                    s.cframe.position[0] += normal[0] * overlap;
+                    s.cframe.position[1] += normal[1] * overlap;
+                    s.cframe.position[2] += normal[2] * overlap;
+
+                    // Reflect velocity along collision normal
+                    const vn = Vec3.dot(s.vel, normal);
+                    if (vn < 0) {
+                        s.vel[0] -= (1 + this.restitution) * vn * normal[0];
+                        s.vel[1] -= (1 + this.restitution) * vn * normal[1];
+                        s.vel[2] -= (1 + this.restitution) * vn * normal[2];
+                    }
+                }
+            }
+        }
+
+        // 3. Sphere-to-Sphere Collisions
+        for (let i = 0; i < this.spheres.length; i++) {
+            for (let j = i + 1; j < this.spheres.length; j++) {
+                const a = this.spheres[i];
+                const b = this.spheres[j];
+                const delta = Vec3.sub(b.cframe.position, a.cframe.position);
+                const dist = Vec3.len(delta);
+                const minDist = a.radius + b.radius;
+
+                if (dist < minDist && dist > 0.0001) {
+                    const norm = Vec3.scale(delta, 1.0 / dist);
+                    const overlap = 0.5 * (minDist - dist);
+
+                    // Separate spheres
+                    a.cframe.position[0] -= norm[0] * overlap;
+                    a.cframe.position[1] -= norm[1] * overlap;
+                    a.cframe.position[2] -= norm[2] * overlap;
+
+                    b.cframe.position[0] += norm[0] * overlap;
+                    b.cframe.position[1] += norm[1] * overlap;
+                    b.cframe.position[2] += norm[2] * overlap;
+
+                    // Velocity response
+                    const relVel = Vec3.sub(b.vel, a.vel);
+                    const impulse = Vec3.dot(relVel, norm);
+                    if (impulse < 0) {
+                        const impulseVec = Vec3.scale(norm, impulse * (1.0 + this.restitution) * 0.5);
+                        a.vel = Vec3.add(a.vel, impulseVec);
+                        b.vel = Vec3.sub(b.vel, impulseVec);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// 5. WEBGL SETUP & SCENE INITIALIZATION
+// ============================================================================
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl', { antialias: true, alpha: false });
+
+function compileShader(gl, src, type) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+        console.error(gl.getShaderInfoLog(s));
+    }
+    return s;
+}
+
+const prog = gl.createProgram();
+gl.attachShader(prog, compileShader(gl, vsSource, gl.VERTEX_SHADER));
+gl.attachShader(prog, compileShader(gl, fsSource, gl.FRAGMENT_SHADER));
+gl.linkProgram(prog);
+gl.useProgram(prog);
+
+const loc = {
+    aPos: gl.getAttribLocation(prog, "aPosition"),
+    aNorm: gl.getAttribLocation(prog, "aNormal"),
+    aCol: gl.getAttribLocation(prog, "aColor"),
+    uModel: gl.getUniformLocation(prog, "uModel"),
+    uView: gl.getUniformLocation(prog, "uView"),
+    uProj: gl.getUniformLocation(prog, "uProjection"),
+    uNormMat: gl.getUniformLocation(prog, "uNormalMatrix"),
+    uLightDir: gl.getUniformLocation(prog, "uLightDir"),
+    uLightColor: gl.getUniformLocation(prog, "uLightColor"),
+    uAmbientColor: gl.getUniformLocation(prog, "uAmbientColor"),
+    uViewPos: gl.getUniformLocation(prog, "uViewPos"),
+    uShininess: gl.getUniformLocation(prog, "uShininess"),
+    uFogStart: gl.getUniformLocation(prog, "uFogStart"),
+    uFogEnd: gl.getUniformLocation(prog, "uFogEnd"),
+    uFogColor: gl.getUniformLocation(prog, "uFogColor")
+};
+
+function uploadMesh(mesh) {
+    const vboP = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, vboP);
+    gl.bufferData(gl.ARRAY_BUFFER, mesh.positions, gl.STATIC_DRAW);
+
+    const vboN = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, vboN);
+    gl.bufferData(gl.ARRAY_BUFFER, mesh.normals, gl.STATIC_DRAW);
+
+    const vboC = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, vboC);
+    gl.bufferData(gl.ARRAY_BUFFER, mesh.colors, gl.STATIC_DRAW);
+
+    return { vboP, vboN, vboC, count: mesh.count };
+}
+
+// Meshes
+const floorMesh   = uploadMesh(createGridFloor(60, 30, [0.35, 0.55, 0.35], [0.38, 0.60, 0.38]));
+const sphereMesh  = uploadMesh(createSphere(1.5, 12, 14, [0.85, 0.20, 0.20]));
+const cubeRed     = uploadMesh(createCube(1.5, 1.0, 1.0, [0.85, 0.40, 0.15]));
+const cubeBlue    = uploadMesh(createCube(1.0, 2.5, 1.0, [0.15, 0.45, 0.85]));
+const cubeYellow  = uploadMesh(createCube(0.8, 0.8, 0.8, [0.95, 0.80, 0.10]));
+
+// Instantiate Physics World
+const world = new PhysicsWorld();
+
+// Static Obstacles (AABBs aligned with your boxes)
+const staticObjects = [
+    { mesh: cubeRed,    cframe: new CFrame(-4.5, 1.0, 1.0), half: [1.5, 1.0, 1.0] },
+    { mesh: cubeBlue,   cframe: new CFrame(4.5, 2.5, -2.0), half: [1.0, 2.5, 1.0] },
+    { mesh: cubeYellow, cframe: new CFrame(0.0, 0.8, 4.0),  half: [0.8, 0.8, 0.8] }
+];
+
+for (const obj of staticObjects) {
+    const p = obj.cframe.position, h = obj.half;
+    world.addStaticBox({
+        min: [p[0] - h[0], p[1] - h[1], p[2] - h[2]],
+        max: [p[0] + h[0], p[1] + h[1], p[2] + h[2]]
+    });
+}
+
+// Function to spawn dynamic physics spheres
+function spawnSphere(x, y, z, vx = 0, vy = 0, vz = 0) {
+    const s = {
+        radius: 1.5,
+        cframe: new CFrame(x, y, z),
+        vel: Vec3.create(vx, vy, vz),
+        mesh: sphereMesh
+    };
+    world.addSphere(s);
+}
+
+// Spawn initial red sphere high above
+spawnSphere(0, 12.0, 0, (Math.random() - 0.5) * 3, 0, (Math.random() - 0.5) * 3);
+
+// ============================================================================
+// 6. CAMERA & USER CONTROLS
+// ============================================================================
+const FOG_COLOR = [0.65, 0.75, 0.85];
+let camYaw = 0.6, camPitch = 0.35, camDist = 22.0;
+let isDragging = false, lastMouseX = 0, lastMouseY = 0;
+
+window.addEventListener('contextmenu', e => e.preventDefault());
+
+window.addEventListener('mousedown', e => {
+    if (e.target.tagName === 'INPUT') return;
+    if (e.button === 0) {
+        isDragging = true;
+        lastMouseX = e.clientX;
+        lastMouseY = e.clientY;
+    } else if (e.button === 2) {
+        // Right click spawns sphere
+        spawnSphere((Math.random() - 0.5) * 6, 12, (Math.random() - 0.5) * 6);
+    }
+});
+
+window.addEventListener('keydown', e => {
+    if (e.code === 'Space') {
+        spawnSphere((Math.random() - 0.5) * 6, 12, (Math.random() - 0.5) * 6);
+    }
+});
+
+window.addEventListener('mousemove', e => {
+    if (!isDragging) return;
+    const dx = e.clientX - lastMouseX;
+    const dy = e.clientY - lastMouseY;
+    camYaw -= dx * 0.008;
+    camPitch = Math.max(0.05, Math.min(Math.PI / 2 - 0.05, camPitch + dy * 0.008));
+    lastMouseX = e.clientX;
+    lastMouseY = e.clientY;
+});
+
+window.addEventListener('mouseup', () => isDragging = false);
+window.addEventListener('wheel', e => {
+    camDist = Math.max(5.0, Math.min(60.0, camDist + e.deltaY * 0.02));
+});
+
+function drawMesh(meshObj, modelMat) {
+    gl.uniformMatrix4fv(loc.uModel, false, modelMat);
+    const nm = new Float32Array([
+        modelMat[0], modelMat[1], modelMat[2],
+        modelMat[4], modelMat[5], modelMat[6],
+        modelMat[8], modelMat[9], modelMat[10]
+    ]);
+    gl.uniformMatrix3fv(loc.uNormMat, false, nm);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, meshObj.vboP);
+    gl.vertexAttribPointer(loc.aPos, 3, gl.FLOAT, false, 0, 0);
+    gl.enableVertexAttribArray(loc.aPos);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, meshObj.vboN);
+    gl.vertexAttribPointer(loc.aNorm, 3, gl.FLOAT, false, 0, 0);
+    gl.enableVertexAttribArray(loc.aNorm);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, meshObj.vboC);
+    gl.vertexAttribPointer(loc.aCol, 3, gl.FLOAT, false, 0, 0);
+    gl.enableVertexAttribArray(loc.aCol);
+
+    gl.drawArrays(gl.TRIANGLES, 0, meshObj.count);
+}
+
+// ============================================================================
+// 7. RENDER & SIMULATION LOOP
+// ============================================================================
+function render() {
+    // 1. Step the Physics World forward by 1/60th second
+    world.step(1 / 60);
+
+    // 2. Viewport & Canvas resize
+    if (canvas.width !== window.innerWidth || canvas.height !== window.innerHeight) {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        gl.viewport(0, 0, canvas.width, canvas.height);
+    }
+
+    gl.enable(gl.DEPTH_TEST);
+    gl.clearColor(FOG_COLOR[0], FOG_COLOR[1], FOG_COLOR[2], 1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+    // 3. Camera Projection
+    const eyeX = camDist * Math.cos(camPitch) * Math.sin(camYaw);
+    const eyeY = camDist * Math.sin(camPitch);
+    const eyeZ = camDist * Math.cos(camPitch) * Math.cos(camYaw);
+    const eye = Vec3.create(eyeX, eyeY, eyeZ);
+    const target = Vec3.create(0, 1.5, 0);
+    const up = Vec3.create(0, 1, 0);
+
+    gl.uniformMatrix4fv(loc.uProj, false, Mat4.perspective(Math.PI / 4, canvas.width / canvas.height, 0.5, 100.0));
+    gl.uniformMatrix4fv(loc.uView, false, Mat4.lookAt(eye, target, up));
+    gl.uniform3fv(loc.uViewPos, eye);
+
+    // 4. Lighting Uniforms
+    const shininess = parseFloat(document.getElementById('shininess').value);
+    const sunPitchDeg = parseFloat(document.getElementById('sunAngle').value);
+    const fogEnd = parseFloat(document.getElementById('fogEnd').value);
+
+    const sunRad = (sunPitchDeg * Math.PI) / 180;
+    const lightDir = Vec3.normalize(Vec3.create(Math.cos(sunRad) * 0.6, Math.sin(sunRad), Math.cos(sunRad) * 0.8));
+
+    gl.uniform3fv(loc.uLightDir, lightDir);
+    gl.uniform3fv(loc.uLightColor, [1.0, 0.98, 0.90]);
+    gl.uniform3fv(loc.uAmbientColor, [0.35, 0.38, 0.45]);
+    gl.uniform1f(loc.uShininess, shininess);
+    gl.uniform3fv(loc.uFogColor, FOG_COLOR);
+    gl.uniform1f(loc.uFogStart, 8.0);
+    gl.uniform1f(loc.uFogEnd, fogEnd);
+
+    // 5. Draw Floor
+    drawMesh(floorMesh, Mat4.createIdentity());
+
+    // 6. Draw Static Boxes
+    for (const obj of staticObjects) {
+        drawMesh(obj.mesh, obj.cframe.toMat4());
+    }
+
+    // 7. Draw Dynamic Physics Spheres
+    for (const s of world.spheres) {
+        drawMesh(s.mesh, s.cframe.toMat4());
+    }
+
+    requestAnimationFrame(render);
+}
+
+requestAnimationFrame(render);
+</script>
+</body>
+</html>
