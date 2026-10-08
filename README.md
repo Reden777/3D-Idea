@@ -1,5 +1,5 @@
 # 3D Idea
-A G3D 6.10-like renderer in 1 html file that will someday have SPOOK-like bounciness (PHUN) as an optional mode.
+A G3D 6.10-like renderer in 1 html file that will someday have SPOOK-like bounciness (PHUN) as an optional mode. In Version2.html, you can right click to spawn more red Gouraud shaded balls. All 3d shaders & everything it needs are included in the one file.
 
 I am actually unsure if I want it full Roblox or mixed PHUN Physics in Roblox. Or even a separate, different engine:
 
